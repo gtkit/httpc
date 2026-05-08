@@ -16,6 +16,7 @@ go get github.com/gtkit/httpc
 - **JSON 编解码**: 使用 `github.com/gtkit/json/v2`，构建时可切换 sonic/go-json/jsoniter
 - **连接池**: MaxIdleConns=100, MaxIdleConnsPerHost=10, HTTP/2, KeepAlive
 - **Body drain**: 自动排空响应体确保连接复用
+- **Redirect 控制**: 默认跟随 3xx，也可禁用自动跳转或自定义跳转策略
 - **结构化日志**: 每次请求/响应/错误都会通过 `Logger` 接口记录
 - **Context 传播**: 所有方法第一个参数都是 `context.Context`
 
@@ -52,6 +53,10 @@ resp, err := c.Head(ctx, url, nil)
 
 // Fire-and-forget（result 传 nil）
 c.PostJSON(ctx, url, body, nil)
+
+// 禁止自动跟随 3xx，直接读取 Location / status
+c = httpc.New(httpc.WithoutRedirect())
+body, status, err := c.GetRaw(ctx, url, nil)
 ```
 
 ## Logger 集成

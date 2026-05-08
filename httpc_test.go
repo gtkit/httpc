@@ -80,6 +80,67 @@ func TestNew_NilOptions(t *testing.T) {
 	}
 }
 
+func TestWithoutRedirect(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("target"))
+	}))
+	defer target.Close()
+
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	defer redirector.Close()
+
+	c := New(WithHTTPClient(redirector.Client()), WithoutRedirect())
+	body, status, err := c.GetRaw(t.Context(), redirector.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != http.StatusFound {
+		t.Errorf("status = %d, want %d", status, http.StatusFound)
+	}
+	if string(body) == "target" {
+		t.Error("unexpectedly followed redirect")
+	}
+}
+
+func TestWithCheckRedirect(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"ok":true}`))
+	}))
+	defer target.Close()
+
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	defer redirector.Close()
+
+	var seenVia int
+	c := New(
+		WithHTTPClient(redirector.Client()),
+		WithCheckRedirect(func(req *http.Request, via []*http.Request) error {
+			seenVia = len(via)
+			return nil
+		}),
+	)
+
+	var result map[string]bool
+	status, err := c.GetJSON(t.Context(), redirector.URL, nil, &result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != http.StatusOK {
+		t.Errorf("status = %d, want %d", status, http.StatusOK)
+	}
+	if !result["ok"] {
+		t.Error("missing redirected response body")
+	}
+	if seenVia != 1 {
+		t.Errorf("seenVia = %d, want 1", seenVia)
+	}
+}
+
 func TestHTTPClient(t *testing.T) {
 	if New().HTTPClient() == nil {
 		t.Error("nil")

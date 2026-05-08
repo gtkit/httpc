@@ -265,6 +265,23 @@ func WithHTTPClient(hc *http.Client) Option {
 	}
 }
 
+// WithCheckRedirect sets the redirect policy used by the underlying [http.Client].
+// Pass [http.ErrUseLastResponse] from the function to return the latest 3xx response.
+func WithCheckRedirect(fn func(req *http.Request, via []*http.Request) error) Option {
+	return func(c *Client) {
+		if fn != nil {
+			c.http.CheckRedirect = fn
+		}
+	}
+}
+
+// WithoutRedirect disables automatic redirect following.
+func WithoutRedirect() Option {
+	return WithCheckRedirect(func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	})
+}
+
 // WithTimeout sets the HTTP client timeout (default 10s).
 func WithTimeout(d time.Duration) Option {
 	return func(c *Client) {

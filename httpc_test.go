@@ -3,7 +3,6 @@ package httpc
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -16,64 +15,6 @@ import (
 
 	"github.com/gtkit/json/v2"
 )
-
-// --- testLogger verifies Logger is actually called ---
-
-type testLogger struct {
-	mu   sync.Mutex
-	logs []string
-}
-
-func (l *testLogger) Debug(msg string, kv ...any) { l.record("DEBUG", msg) }
-func (l *testLogger) Info(msg string, kv ...any)  { l.record("INFO", msg) }
-func (l *testLogger) Warn(msg string, kv ...any)  { l.record("WARN", msg) }
-func (l *testLogger) Error(msg string, kv ...any) { l.record("ERROR", msg) }
-
-func (l *testLogger) record(level, msg string) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.logs = append(l.logs, level+": "+msg)
-}
-
-func (l *testLogger) has(substr string) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	for _, log := range l.logs {
-		if strings.Contains(log, substr) {
-			return true
-		}
-	}
-	return false
-}
-
-// --- kvLogger captures messages together with their key/value pairs ---
-
-type kvLogger struct {
-	mu      sync.Mutex
-	entries []string
-}
-
-func (l *kvLogger) write(msg string, kv []any) {
-	b := strings.Builder{}
-	b.WriteString(msg)
-	for i := 0; i+1 < len(kv); i += 2 {
-		fmt.Fprintf(&b, " %v=%v", kv[i], kv[i+1])
-	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.entries = append(l.entries, b.String())
-}
-
-func (l *kvLogger) Debug(msg string, kv ...any) { l.write(msg, kv) }
-func (l *kvLogger) Info(msg string, kv ...any)  { l.write(msg, kv) }
-func (l *kvLogger) Warn(msg string, kv ...any)  { l.write(msg, kv) }
-func (l *kvLogger) Error(msg string, kv ...any) { l.write(msg, kv) }
-
-func (l *kvLogger) dump() string {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return strings.Join(l.entries, "\n")
-}
 
 // sizedServer returns a server whose body is exactly n bytes.
 func sizedServer(n int) *httptest.Server {
@@ -109,15 +50,14 @@ func TestNew_Defaults(t *testing.T) {
 }
 
 func TestNew_WithOptions(t *testing.T) {
-	logger := &testLogger{}
-	c := New(WithTimeout(30*time.Second), WithLogger(logger))
+	c := New(WithTimeout(30 * time.Second))
 	if c.http.Timeout != 30*time.Second {
 		t.Errorf("timeout = %v", c.http.Timeout)
 	}
 }
 
 func TestNew_NilOptions(t *testing.T) {
-	c := New(WithHTTPClient(nil), WithLogger(nil), WithTransport(nil), WithTimeout(0))
+	c := New(WithHTTPClient(nil), WithTransport(nil), WithTimeout(0))
 	if c.http == nil {
 		t.Error("nil")
 	}
@@ -196,8 +136,7 @@ func TestGetJSON(t *testing.T) {
 	srv := echoServer()
 	defer srv.Close()
 
-	logger := &testLogger{}
-	c := New(WithHTTPClient(srv.Client()), WithLogger(logger))
+	c := New(WithHTTPClient(srv.Client()))
 
 	var result map[string]any
 	status, err := c.GetJSON(t.Context(), srv.URL, map[string]string{"Authorization": "Bearer tok"}, &result)
@@ -209,15 +148,6 @@ func TestGetJSON(t *testing.T) {
 	}
 	if result["auth"] != "Bearer tok" {
 		t.Errorf("auth = %v", result["auth"])
-	}
-
-	// Verify the request was logged at Debug. httpc no longer emits a per-response
-	// Info log (slimmed to Debug+Error to avoid duplicating caller-side logging).
-	if !logger.has("httpc: request") {
-		t.Error("logger.Debug not called for request")
-	}
-	if logger.has("httpc: response") {
-		t.Error("per-response Info log should have been removed")
 	}
 }
 
@@ -366,15 +296,15 @@ func TestDo(t *testing.T) {
 // --- Error cases ---
 
 func TestPostJSON_NetworkError(t *testing.T) {
-	logger := &testLogger{}
-	c := New(WithTimeout(time.Second), WithLogger(logger))
+	c := New(WithTimeout(time.Second))
 	var result map[string]any
 	_, err := c.PostJSON(t.Context(), "http://127.0.0.1:1", map[string]string{}, &result)
 	if err == nil {
 		t.Fatal("expected error")
 	}
-	if !logger.has("httpc: request failed") {
-		t.Error("error not logged")
+	// The error identifies the method+URL for the caller to log.
+	if !strings.Contains(err.Error(), "POST") {
+		t.Errorf("error lacks method context: %v", err)
 	}
 }
 
@@ -384,15 +314,14 @@ func TestPostJSON_InvalidJSON(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	logger := &testLogger{}
-	c := New(WithHTTPClient(srv.Client()), WithLogger(logger))
+	c := New(WithHTTPClient(srv.Client()))
 	var result map[string]any
 	_, err := c.PostJSON(t.Context(), srv.URL, nil, &result)
 	if err == nil {
 		t.Fatal("expected error")
 	}
-	if !logger.has("decode response failed") {
-		t.Error("decode error not logged")
+	if !strings.Contains(err.Error(), "decode") {
+		t.Errorf("expected decode error, got: %v", err)
 	}
 }
 
@@ -996,29 +925,29 @@ func TestGetRaw_EmptyBody_NoError(t *testing.T) {
 	}
 }
 
-// --- Log redaction ---
+// --- Error redaction ---
 
-func TestDo_RedactsURLUserinfo(t *testing.T) {
-	srv := echoServer()
-	defer srv.Close()
+// The transport error wraps the URL with userinfo password masked, so a caller
+// that logs the returned error does not leak credentials embedded in the URL.
+func TestDo_ErrorRedactsURLUserinfo(t *testing.T) {
+	c := New(WithTimeout(time.Second))
 
-	lg := &kvLogger{}
-	c := New(WithHTTPClient(srv.Client()), WithLogger(lg))
-
-	u, _ := url.Parse(srv.URL)
-	u.User = url.UserPassword("alice", "s3cr3t-pass")
+	u := url.URL{
+		Scheme: "http",
+		User:   url.UserPassword("alice", "s3cr3t-pass"),
+		Host:   "127.0.0.1:1", // unreachable → transport error
+	}
 
 	var r map[string]any
-	if _, err := c.GetJSON(t.Context(), u.String(), nil, &r); err != nil {
-		t.Fatal(err)
+	_, err := c.GetJSON(t.Context(), u.String(), nil, &r)
+	if err == nil {
+		t.Fatal("expected transport error")
 	}
-
-	dump := lg.dump()
-	if strings.Contains(dump, "s3cr3t-pass") {
-		t.Errorf("password leaked into logs:\n%s", dump)
+	if strings.Contains(err.Error(), "s3cr3t-pass") {
+		t.Errorf("password leaked into error: %v", err)
 	}
-	if !strings.Contains(dump, "xxxxx") {
-		t.Errorf("expected redaction marker xxxxx, got:\n%s", dump)
+	if !strings.Contains(err.Error(), "xxxxx") {
+		t.Errorf("expected redaction marker xxxxx, got: %v", err)
 	}
 }
 
@@ -1047,14 +976,4 @@ func TestConnectionReuse(t *testing.T) {
 	if n := atomic.LoadInt32(&newConns); n != 1 {
 		t.Errorf("opened %d connections, want 1 (connection reuse broken)", n)
 	}
-}
-
-// --- NopLogger ---
-
-func TestNopLogger(t *testing.T) {
-	var l NopLogger
-	l.Debug("x")
-	l.Info("x")
-	l.Warn("x")
-	l.Error("x")
 }

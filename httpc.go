@@ -54,41 +54,15 @@ var ErrResponseTooLarge = errors.New("httpc: response body exceeds limit")
 // body is expected and should not be treated as an error.
 var ErrEmptyBody = errors.New("httpc: empty response body")
 
-// Logger defines a minimal structured logging interface.
-//
-// httpc keeps internal logging deliberately sparse to avoid duplicating what
-// callers already log from return values: it emits Debug for each outgoing
-// request (and for read/decode/empty-body diagnostics) and Error only on
-// transport failures. The Info and Warn methods are part of the interface for
-// adapter completeness but are not currently called by httpc.
-//
-// Implement this to integrate with zap, slog, zerolog, or gtkit/logger:
-//
-//	type zapAdapter struct{ l *zap.SugaredLogger }
-//	func (z *zapAdapter) Debug(msg string, kv ...any) { z.l.Debugw(msg, kv...) }
-//	func (z *zapAdapter) Info(msg string, kv ...any)  { z.l.Infow(msg, kv...)  }
-//	func (z *zapAdapter) Warn(msg string, kv ...any)  { z.l.Warnw(msg, kv...)  }
-//	func (z *zapAdapter) Error(msg string, kv ...any) { z.l.Errorw(msg, kv...) }
-type Logger interface {
-	Debug(msg string, keysAndValues ...any)
-	Info(msg string, keysAndValues ...any)
-	Warn(msg string, keysAndValues ...any)
-	Error(msg string, keysAndValues ...any)
-}
-
-// NopLogger discards all log output. Used as the default.
-type NopLogger struct{}
-
-func (NopLogger) Debug(string, ...any) {}
-func (NopLogger) Info(string, ...any)  {}
-func (NopLogger) Warn(string, ...any)  {}
-func (NopLogger) Error(string, ...any) {}
-
 // Client is a concurrency-safe HTTP client optimized for JSON APIs.
 // All fields are read-only after construction — safe to share across goroutines.
+//
+// By design httpc does not log: every outcome (status, headers, error) is
+// returned to the caller, who should log it from their own layer with full
+// business context. For transport-level tracing (DNS, TLS, connection reuse),
+// attach a [net/http/httptrace.ClientTrace] to the request context.
 type Client struct {
 	http             *http.Client
-	logger           Logger
 	maxResponseBytes int64
 }
 
@@ -99,7 +73,6 @@ type Option func(*Client)
 func New(opts ...Option) *Client {
 	c := &Client{
 		http:             newDefaultHTTPClient(defaultTimeout),
-		logger:           NopLogger{},
 		maxResponseBytes: defaultMaxResponseBytes,
 	}
 	for _, opt := range opts {
@@ -248,19 +221,12 @@ func (c *Client) RequestRawWithHeader(ctx context.Context, method, url string, h
 // The caller is responsible for closing the response body.
 // Prefer the higher-level methods unless you need full control.
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
-	// Redacted() masks any userinfo password embedded in the URL so credentials
-	// do not leak into logs. NOTE: secrets passed as query parameters are still
-	// logged — prefer headers for tokens.
-	safeURL := req.URL.Redacted()
-	c.logger.Debug("httpc: request",
-		"method", req.Method, "url", safeURL,
-	)
 	resp, err := c.http.Do(req)
 	if err != nil {
-		c.logger.Error("httpc: request failed",
-			"method", req.Method, "url", safeURL, "error", err.Error(),
-		)
-		return nil, fmt.Errorf("httpc: %s %s: %w", req.Method, safeURL, err)
+		// Redacted() masks any userinfo password in the URL so credentials do not
+		// leak into the error (which the caller may log). Query-string secrets are
+		// not redacted — prefer headers for tokens.
+		return nil, fmt.Errorf("httpc: %s %s: %w", req.Method, req.URL.Redacted(), err)
 	}
 	return resp, nil
 }
@@ -335,25 +301,14 @@ func (c *Client) doRequestJSON(ctx context.Context, method, url string, headers 
 
 	data, err := c.readBody(resp.Body)
 	if err != nil {
-		c.logger.Debug("httpc: read response failed",
-			"method", method, "url", url,
-			"status", resp.StatusCode, "error", err.Error(),
-		)
 		return resp.Header, resp.StatusCode, err
 	}
 	// Decouple transport from decoding: surface an empty body as a distinct
 	// sentinel so callers can tell "no content" apart from malformed JSON.
 	if len(bytes.TrimSpace(data)) == 0 {
-		c.logger.Debug("httpc: empty response body",
-			"method", method, "url", url, "status", resp.StatusCode,
-		)
 		return resp.Header, resp.StatusCode, ErrEmptyBody
 	}
 	if err := json.Unmarshal(data, result); err != nil {
-		c.logger.Debug("httpc: decode response failed",
-			"method", method, "url", url,
-			"status", resp.StatusCode, "error", err.Error(),
-		)
 		return resp.Header, resp.StatusCode, fmt.Errorf("httpc: decode response: %w", err)
 	}
 	return resp.Header, resp.StatusCode, nil
@@ -374,10 +329,6 @@ func (c *Client) doRequestRaw(ctx context.Context, method, url string, headers m
 
 	data, err := c.readBody(resp.Body)
 	if err != nil {
-		c.logger.Debug("httpc: read response failed",
-			"method", method, "url", url,
-			"status", resp.StatusCode, "error", err.Error(),
-		)
 		return resp.Header, nil, resp.StatusCode, err
 	}
 	return resp.Header, data, resp.StatusCode, nil
@@ -463,15 +414,6 @@ func WithMaxResponseBytes(n int64) Option {
 			n = 0
 		}
 		c.maxResponseBytes = n
-	}
-}
-
-// WithLogger sets a structured logger for request/response logging.
-func WithLogger(l Logger) Option {
-	return func(c *Client) {
-		if l != nil {
-			c.logger = l
-		}
 	}
 }
 

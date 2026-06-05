@@ -18,17 +18,15 @@ go get github.com/gtkit/httpc
 - **JSON 编解码**: 使用 `github.com/gtkit/json/v2`，构建时可切换 sonic/go-json/jsoniter
 - **连接池**: MaxIdleConns=100, MaxIdleConnsPerHost=10, HTTP/2, KeepAlive
 - **安全 Body drain**: 限量排空（≤4 KiB）以复用连接，避免被恶意 body 拖垮
-- **日志脱敏**: 日志中的 URL 自动屏蔽 userinfo 密码（token 请放 header，勿放 query）
 - **Redirect 控制**: 默认跟随 3xx，也可禁用自动跳转或自定义跳转策略
-- **结构化日志**: 每次请求/响应/错误都会通过 `Logger` 接口记录
+- **无内置日志**: 状态码/Header/错误全部回传，由调用方在业务层记录（错误信息自动屏蔽 URL 中的 userinfo 密码）
 - **Context 传播**: 所有方法第一个参数都是 `context.Context`
 
 ## 使用
 
 ```go
 c := httpc.New(
-    httpc.WithTimeout(10*time.Second),
-    httpc.WithLogger(myZapAdapter),
+    httpc.WithTimeout(10 * time.Second),
 )
 
 // JSON POST
@@ -75,25 +73,21 @@ c = httpc.New(httpc.WithoutRedirect())
 body, status, err := c.GetRaw(ctx, url, nil)
 ```
 
-## Logger 集成
+## 日志（由调用方负责）
 
-httpc 的内部日志刻意保持克制，避免与调用方基于返回值的日志重复：**仅** 对每个请求记 `Debug`、对传输错误记 `Error`（读/解码/空 body 等诊断也走 `Debug`）。`Info`/`Warn` 仍在接口里以便 adapter 完整实现，但 httpc 不会调用。状态码、Header、错误都通过返回值给到调用方，请在业务层带上下文记录。
+httpc **不内置日志**。状态码、Header、错误都通过返回值给到调用方 —— 库内再记一遍只是重复，且缺少业务上下文（trace-id 等）。请在你自己的调用层记录：
 
 ```go
-type zapLogger struct{ l *zap.SugaredLogger }
-func (z *zapLogger) Debug(msg string, kv ...any) { z.l.Debugw(msg, kv...) }
-func (z *zapLogger) Info(msg string, kv ...any)  { z.l.Infow(msg, kv...)  }
-func (z *zapLogger) Warn(msg string, kv ...any)  { z.l.Warnw(msg, kv...)  }
-func (z *zapLogger) Error(msg string, kv ...any) { z.l.Errorw(msg, kv...) }
-
-c := httpc.New(httpc.WithLogger(&zapLogger{l: zap.S()}))
+status, err := c.GetJSON(ctx, url, headers, &result)
+if err != nil {
+    log.Errorw("upstream call failed", "url", url, "status", status, "err", err)
+    return err
+}
 ```
 
-日志输出示例：
-```
-DEBUG httpc: request method=POST url=https://api.example.com/token
-ERROR httpc: request failed method=POST url=... error=dial tcp ...
-```
+错误信息已自动屏蔽 URL 中的 userinfo 密码（`user:xxxxx@host`）；但 query 中的 token 不会脱敏 —— **token 请放 header，勿放 query**。
+
+需要连接级追踪（DNS / TLS 握手 / 连接复用）时，给请求 context 挂 [`net/http/httptrace.ClientTrace`](https://pkg.go.dev/net/http/httptrace) 即可，无需库内日志。
 
 ## 空 body 与状态码
 

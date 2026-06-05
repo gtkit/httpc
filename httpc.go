@@ -87,26 +87,69 @@ func (c *Client) HTTPClient() *http.Client { return c.http }
 
 // GetJSON sends GET with custom headers and JSON-decodes the response.
 func (c *Client) GetJSON(ctx context.Context, url string, headers map[string]string, result any) (int, error) {
-	return c.doRequestJSON(ctx, http.MethodGet, url, headers, nil, result)
+	_, status, err := c.doRequestJSON(ctx, http.MethodGet, url, headers, nil, result)
+	return status, err
 }
 
 // PostJSON sends POST with a JSON body and JSON-decodes the response.
 func (c *Client) PostJSON(ctx context.Context, url string, body any, result any) (int, error) {
-	return c.doRequestJSON(ctx, http.MethodPost, url, nil, body, result)
+	_, status, err := c.doRequestJSON(ctx, http.MethodPost, url, nil, body, result)
+	return status, err
 }
 
 // PutJSON sends PUT with a JSON body and JSON-decodes the response.
 func (c *Client) PutJSON(ctx context.Context, url string, body any, result any) (int, error) {
-	return c.doRequestJSON(ctx, http.MethodPut, url, nil, body, result)
+	_, status, err := c.doRequestJSON(ctx, http.MethodPut, url, nil, body, result)
+	return status, err
 }
 
 // PatchJSON sends PATCH with a JSON body and JSON-decodes the response.
 func (c *Client) PatchJSON(ctx context.Context, url string, body any, result any) (int, error) {
-	return c.doRequestJSON(ctx, http.MethodPatch, url, nil, body, result)
+	_, status, err := c.doRequestJSON(ctx, http.MethodPatch, url, nil, body, result)
+	return status, err
 }
 
 // DeleteJSON sends DELETE with optional JSON body and JSON-decodes the response.
 func (c *Client) DeleteJSON(ctx context.Context, url string, body any, result any) (int, error) {
+	_, status, err := c.doRequestJSON(ctx, http.MethodDelete, url, nil, body, result)
+	return status, err
+}
+
+// --- JSON convenience methods returning response headers ---
+//
+// The *WithHeader variants mirror the methods above but additionally return the
+// response [http.Header]. The header is returned whenever a response was
+// received — including when JSON decoding fails — so callers can inspect
+// metadata such as Content-Type, ETag, or X-Request-Id for diagnostics.
+// On transport-level errors (no response) the returned header is nil.
+
+// GetJSONWithHeader sends GET with custom headers, JSON-decodes the response,
+// and returns the response headers.
+func (c *Client) GetJSONWithHeader(ctx context.Context, url string, headers map[string]string, result any) (http.Header, int, error) {
+	return c.doRequestJSON(ctx, http.MethodGet, url, headers, nil, result)
+}
+
+// PostJSONWithHeader sends POST with a JSON body, JSON-decodes the response,
+// and returns the response headers.
+func (c *Client) PostJSONWithHeader(ctx context.Context, url string, body any, result any) (http.Header, int, error) {
+	return c.doRequestJSON(ctx, http.MethodPost, url, nil, body, result)
+}
+
+// PutJSONWithHeader sends PUT with a JSON body, JSON-decodes the response,
+// and returns the response headers.
+func (c *Client) PutJSONWithHeader(ctx context.Context, url string, body any, result any) (http.Header, int, error) {
+	return c.doRequestJSON(ctx, http.MethodPut, url, nil, body, result)
+}
+
+// PatchJSONWithHeader sends PATCH with a JSON body, JSON-decodes the response,
+// and returns the response headers.
+func (c *Client) PatchJSONWithHeader(ctx context.Context, url string, body any, result any) (http.Header, int, error) {
+	return c.doRequestJSON(ctx, http.MethodPatch, url, nil, body, result)
+}
+
+// DeleteJSONWithHeader sends DELETE with an optional JSON body, JSON-decodes the
+// response, and returns the response headers.
+func (c *Client) DeleteJSONWithHeader(ctx context.Context, url string, body any, result any) (http.Header, int, error) {
 	return c.doRequestJSON(ctx, http.MethodDelete, url, nil, body, result)
 }
 
@@ -128,6 +171,17 @@ func (c *Client) PostRaw(ctx context.Context, url string, body any) ([]byte, int
 // RequestJSON sends any HTTP method with custom headers, optional JSON body,
 // and JSON-decodes the response.
 func (c *Client) RequestJSON(ctx context.Context, method, url string, headers map[string]string, body any, result any) (int, error) {
+	_, status, err := c.doRequestJSON(ctx, method, url, headers, body, result)
+	return status, err
+}
+
+// RequestJSONWithHeader sends any HTTP method with custom headers, optional JSON
+// body, JSON-decodes the response, and returns the response headers.
+//
+// This is the most general header-returning method; the *WithHeader convenience
+// methods delegate to the same code path. See the *WithHeader documentation for
+// the header return semantics.
+func (c *Client) RequestJSONWithHeader(ctx context.Context, method, url string, headers map[string]string, body any, result any) (http.Header, int, error) {
 	return c.doRequestJSON(ctx, method, url, headers, body, result)
 }
 
@@ -204,15 +258,21 @@ func (c *Client) buildRequest(ctx context.Context, method, url string, headers m
 }
 
 // doRequestJSON builds, executes, and JSON-decodes the response.
-func (c *Client) doRequestJSON(ctx context.Context, method, url string, headers map[string]string, body any, result any) (int, error) {
+//
+// It returns the response [http.Header] whenever a response was received
+// (including on decode failure); the header is nil only on transport-level
+// errors where no response exists. The returned header is the response's own
+// map — safe to read after the body is drained and closed, since headers are
+// fully parsed before the body is read.
+func (c *Client) doRequestJSON(ctx context.Context, method, url string, headers map[string]string, body any, result any) (http.Header, int, error) {
 	req, err := c.buildRequest(ctx, method, url, headers, body)
 	if err != nil {
-		return 0, err
+		return nil, 0, err
 	}
 
 	resp, err := c.Do(req)
 	if err != nil {
-		return 0, err
+		return nil, 0, err
 	}
 	defer drainAndClose(resp.Body)
 
@@ -222,10 +282,10 @@ func (c *Client) doRequestJSON(ctx context.Context, method, url string, headers 
 				"method", method, "url", url,
 				"status", resp.StatusCode, "error", err.Error(),
 			)
-			return resp.StatusCode, fmt.Errorf("httpc: decode response: %w", err)
+			return resp.Header, resp.StatusCode, fmt.Errorf("httpc: decode response: %w", err)
 		}
 	}
-	return resp.StatusCode, nil
+	return resp.Header, resp.StatusCode, nil
 }
 
 // doRequestRaw builds, executes, and returns the raw response body.

@@ -471,6 +471,226 @@ func TestConcurrent_GetRaw(t *testing.T) {
 	}
 }
 
+// --- *WithHeader methods ---
+
+// headerServer echoes the request method and sets a few response headers.
+func headerServer() *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Request-Id", "req-123")
+		w.Header().Add("X-Multi", "a")
+		w.Header().Add("X-Multi", "b")
+		data, _ := json.Marshal(map[string]any{"method": r.Method})
+		w.Write(data)
+	}))
+}
+
+func TestRequestJSONWithHeader(t *testing.T) {
+	srv := headerServer()
+	defer srv.Close()
+	c := New(WithHTTPClient(srv.Client()))
+
+	var result map[string]any
+	header, status, err := c.RequestJSONWithHeader(t.Context(), http.MethodGet, srv.URL, nil, nil, &result)
+	if err != nil || status != 200 {
+		t.Fatalf("err=%v status=%d", err, status)
+	}
+	if header == nil {
+		t.Fatal("header is nil")
+	}
+	if header.Get("X-Request-Id") != "req-123" {
+		t.Errorf("X-Request-Id = %q", header.Get("X-Request-Id"))
+	}
+	if got := header.Values("X-Multi"); len(got) != 2 || got[0] != "a" || got[1] != "b" {
+		t.Errorf("X-Multi = %v", got)
+	}
+	if result["method"] != "GET" {
+		t.Errorf("method = %v", result["method"])
+	}
+}
+
+func TestGetJSONWithHeader(t *testing.T) {
+	srv := headerServer()
+	defer srv.Close()
+	c := New(WithHTTPClient(srv.Client()))
+
+	var result map[string]any
+	header, status, err := c.GetJSONWithHeader(t.Context(), srv.URL,
+		map[string]string{"Authorization": "Bearer tok"}, &result)
+	if err != nil || status != 200 || header.Get("X-Request-Id") != "req-123" || result["method"] != "GET" {
+		t.Fatalf("err=%v status=%d xrid=%q method=%v", err, status, header.Get("X-Request-Id"), result["method"])
+	}
+}
+
+func TestPostJSONWithHeader(t *testing.T) {
+	srv := headerServer()
+	defer srv.Close()
+	c := New(WithHTTPClient(srv.Client()))
+
+	var result map[string]any
+	header, status, err := c.PostJSONWithHeader(t.Context(), srv.URL, map[string]string{"k": "v"}, &result)
+	if err != nil || status != 200 || header.Get("Content-Type") != "application/json" || result["method"] != "POST" {
+		t.Fatalf("err=%v status=%d ct=%q method=%v", err, status, header.Get("Content-Type"), result["method"])
+	}
+}
+
+func TestPutPatchDeleteJSONWithHeader(t *testing.T) {
+	srv := headerServer()
+	defer srv.Close()
+	c := New(WithHTTPClient(srv.Client()))
+
+	cases := []struct {
+		name   string
+		call   func(result any) (http.Header, int, error)
+		method string
+	}{
+		{"PUT", func(r any) (http.Header, int, error) { return c.PutJSONWithHeader(t.Context(), srv.URL, nil, r) }, "PUT"},
+		{"PATCH", func(r any) (http.Header, int, error) { return c.PatchJSONWithHeader(t.Context(), srv.URL, nil, r) }, "PATCH"},
+		{"DELETE", func(r any) (http.Header, int, error) { return c.DeleteJSONWithHeader(t.Context(), srv.URL, nil, r) }, "DELETE"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var result map[string]any
+			header, status, err := tc.call(&result)
+			if err != nil || status != 200 {
+				t.Fatalf("err=%v status=%d", err, status)
+			}
+			if header.Get("X-Request-Id") != "req-123" {
+				t.Errorf("X-Request-Id = %q", header.Get("X-Request-Id"))
+			}
+			if result["method"] != tc.method {
+				t.Errorf("method = %v, want %s", result["method"], tc.method)
+			}
+		})
+	}
+}
+
+// Header must be returned even when JSON decoding fails, so callers can
+// inspect Content-Type / request-id for diagnostics.
+func TestWithHeader_DecodeError_StillReturnsHeader(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Request-Id", "req-err")
+		w.WriteHeader(500)
+		w.Write([]byte("not json"))
+	}))
+	defer srv.Close()
+	c := New(WithHTTPClient(srv.Client()))
+
+	var result map[string]any
+	header, status, err := c.GetJSONWithHeader(t.Context(), srv.URL, nil, &result)
+	if err == nil {
+		t.Fatal("expected decode error")
+	}
+	if status != 500 {
+		t.Errorf("status = %d, want 500", status)
+	}
+	if header == nil || header.Get("X-Request-Id") != "req-err" {
+		t.Errorf("header lost on decode error: %v", header)
+	}
+}
+
+// On transport-level errors there is no response, so header must be nil.
+func TestWithHeader_TransportError_NilHeader(t *testing.T) {
+	c := New(WithTimeout(time.Second))
+	var result map[string]any
+	header, status, err := c.PostJSONWithHeader(t.Context(), "http://127.0.0.1:1", nil, &result)
+	if err == nil {
+		t.Fatal("expected transport error")
+	}
+	if header != nil {
+		t.Errorf("header = %v, want nil", header)
+	}
+	if status != 0 {
+		t.Errorf("status = %d, want 0", status)
+	}
+}
+
+// nil result (fire-and-forget) must still drain the body and return the header.
+func TestWithHeader_NilResult(t *testing.T) {
+	srv := headerServer()
+	defer srv.Close()
+	c := New(WithHTTPClient(srv.Client()))
+
+	header, status, err := c.PostJSONWithHeader(t.Context(), srv.URL, map[string]string{"a": "b"}, nil)
+	if err != nil || status != 200 {
+		t.Fatalf("err=%v status=%d", err, status)
+	}
+	if header.Get("X-Request-Id") != "req-123" {
+		t.Errorf("X-Request-Id = %q", header.Get("X-Request-Id"))
+	}
+}
+
+// Cross-verification: the WithHeader variant must yield the same status/decode
+// result as the existing GetJSON for an identical request.
+func TestWithHeader_ConsistentWithPlain(t *testing.T) {
+	srv := headerServer()
+	defer srv.Close()
+	c := New(WithHTTPClient(srv.Client()))
+
+	var plain map[string]any
+	plainStatus, plainErr := c.GetJSON(t.Context(), srv.URL, nil, &plain)
+
+	var withHdr map[string]any
+	header, hdrStatus, hdrErr := c.GetJSONWithHeader(t.Context(), srv.URL, nil, &withHdr)
+
+	if plainErr != nil || hdrErr != nil {
+		t.Fatalf("plainErr=%v hdrErr=%v", plainErr, hdrErr)
+	}
+	if plainStatus != hdrStatus {
+		t.Errorf("status mismatch: plain=%d withHeader=%d", plainStatus, hdrStatus)
+	}
+	if plain["method"] != withHdr["method"] {
+		t.Errorf("body mismatch: plain=%v withHeader=%v", plain["method"], withHdr["method"])
+	}
+	if header == nil {
+		t.Error("WithHeader returned nil header on success")
+	}
+}
+
+// Header must remain readable after the body has been drained/closed.
+func TestWithHeader_ReadableAfterBodyDrain(t *testing.T) {
+	srv := headerServer()
+	defer srv.Close()
+	c := New(WithHTTPClient(srv.Client()))
+
+	var result map[string]any
+	header, _, err := c.GetJSONWithHeader(t.Context(), srv.URL, nil, &result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// doRequestJSON has already drained+closed the body via defer by now.
+	if header.Get("Content-Type") != "application/json" {
+		t.Errorf("Content-Type unreadable after drain: %q", header.Get("Content-Type"))
+	}
+}
+
+func TestConcurrent_WithHeader(t *testing.T) {
+	srv := headerServer()
+	defer srv.Close()
+	c := New(WithHTTPClient(srv.Client()))
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 100)
+	for range 100 {
+		wg.Go(func() {
+			var r map[string]any
+			header, _, err := c.PostJSONWithHeader(t.Context(), srv.URL, map[string]string{}, &r)
+			if err != nil {
+				errs <- err
+				return
+			}
+			if header.Get("X-Request-Id") != "req-123" {
+				errs <- err
+			}
+		})
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+}
+
 // --- NopLogger ---
 
 func TestNopLogger(t *testing.T) {

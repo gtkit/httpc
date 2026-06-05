@@ -2,10 +2,15 @@ package httpc
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -39,6 +44,44 @@ func (l *testLogger) has(substr string) bool {
 		}
 	}
 	return false
+}
+
+// --- kvLogger captures messages together with their key/value pairs ---
+
+type kvLogger struct {
+	mu      sync.Mutex
+	entries []string
+}
+
+func (l *kvLogger) write(msg string, kv []any) {
+	b := strings.Builder{}
+	b.WriteString(msg)
+	for i := 0; i+1 < len(kv); i += 2 {
+		fmt.Fprintf(&b, " %v=%v", kv[i], kv[i+1])
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.entries = append(l.entries, b.String())
+}
+
+func (l *kvLogger) Debug(msg string, kv ...any) { l.write(msg, kv) }
+func (l *kvLogger) Info(msg string, kv ...any)  { l.write(msg, kv) }
+func (l *kvLogger) Warn(msg string, kv ...any)  { l.write(msg, kv) }
+func (l *kvLogger) Error(msg string, kv ...any) { l.write(msg, kv) }
+
+func (l *kvLogger) dump() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Join(l.entries, "\n")
+}
+
+// sizedServer returns a server whose body is exactly n bytes.
+func sizedServer(n int) *httptest.Server {
+	body := strings.Repeat("x", n)
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Request-Id", "req-sz")
+		_, _ = w.Write([]byte(body))
+	}))
 }
 
 // --- Helper: echo server that returns request info ---
@@ -688,6 +731,213 @@ func TestConcurrent_WithHeader(t *testing.T) {
 	close(errs)
 	for err := range errs {
 		t.Error(err)
+	}
+}
+
+// --- Raw *WithHeader methods ---
+
+func TestGetRawWithHeader(t *testing.T) {
+	srv := headerServer()
+	defer srv.Close()
+	c := New(WithHTTPClient(srv.Client()))
+
+	header, body, status, err := c.GetRawWithHeader(t.Context(), srv.URL, nil)
+	if err != nil || status != 200 || len(body) == 0 {
+		t.Fatalf("err=%v status=%d len=%d", err, status, len(body))
+	}
+	if header.Get("X-Request-Id") != "req-123" {
+		t.Errorf("X-Request-Id = %q", header.Get("X-Request-Id"))
+	}
+}
+
+func TestPostRawWithHeader(t *testing.T) {
+	srv := headerServer()
+	defer srv.Close()
+	c := New(WithHTTPClient(srv.Client()))
+
+	header, body, status, err := c.PostRawWithHeader(t.Context(), srv.URL, map[string]string{"x": "y"})
+	if err != nil || status != 200 || len(body) == 0 || header.Get("X-Request-Id") != "req-123" {
+		t.Fatalf("err=%v status=%d len=%d xrid=%q", err, status, len(body), header.Get("X-Request-Id"))
+	}
+}
+
+func TestRequestRawWithHeader(t *testing.T) {
+	srv := headerServer()
+	defer srv.Close()
+	c := New(WithHTTPClient(srv.Client()))
+
+	header, body, status, err := c.RequestRawWithHeader(t.Context(), http.MethodGet, srv.URL,
+		map[string]string{"X-Custom": "test"}, nil)
+	if err != nil || status != 200 || len(body) == 0 || header == nil {
+		t.Fatalf("err=%v status=%d len=%d header=%v", err, status, len(body), header)
+	}
+}
+
+// Cross-verification: Raw WithHeader must match plain GetRaw for the same request.
+func TestRawWithHeader_ConsistentWithPlain(t *testing.T) {
+	srv := headerServer()
+	defer srv.Close()
+	c := New(WithHTTPClient(srv.Client()))
+
+	plainBody, plainStatus, plainErr := c.GetRaw(t.Context(), srv.URL, nil)
+	header, hdrBody, hdrStatus, hdrErr := c.GetRawWithHeader(t.Context(), srv.URL, nil)
+
+	if plainErr != nil || hdrErr != nil {
+		t.Fatalf("plainErr=%v hdrErr=%v", plainErr, hdrErr)
+	}
+	if plainStatus != hdrStatus || string(plainBody) != string(hdrBody) {
+		t.Errorf("mismatch: plain(%d,%q) withHeader(%d,%q)", plainStatus, plainBody, hdrStatus, hdrBody)
+	}
+	if header == nil {
+		t.Error("nil header")
+	}
+}
+
+// --- WithMaxResponseBytes ---
+
+func TestMaxResponseBytes_UnderLimit(t *testing.T) {
+	srv := sizedServer(50)
+	defer srv.Close()
+	c := New(WithHTTPClient(srv.Client()), WithMaxResponseBytes(100))
+
+	body, status, err := c.GetRaw(t.Context(), srv.URL, nil)
+	if err != nil || status != 200 || len(body) != 50 {
+		t.Fatalf("err=%v status=%d len=%d", err, status, len(body))
+	}
+}
+
+// A body exactly at the limit must be accepted (boundary correctness).
+func TestMaxResponseBytes_AtLimit(t *testing.T) {
+	srv := sizedServer(100)
+	defer srv.Close()
+	c := New(WithHTTPClient(srv.Client()), WithMaxResponseBytes(100))
+
+	body, status, err := c.GetRaw(t.Context(), srv.URL, nil)
+	if err != nil {
+		t.Fatalf("body at exact limit rejected: %v", err)
+	}
+	if status != 200 || len(body) != 100 {
+		t.Errorf("status=%d len=%d", status, len(body))
+	}
+}
+
+func TestMaxResponseBytes_OverLimit_Raw(t *testing.T) {
+	srv := sizedServer(101)
+	defer srv.Close()
+	c := New(WithHTTPClient(srv.Client()), WithMaxResponseBytes(100))
+
+	_, _, err := c.GetRaw(t.Context(), srv.URL, nil)
+	if !errors.Is(err, ErrResponseTooLarge) {
+		t.Fatalf("err = %v, want ErrResponseTooLarge", err)
+	}
+}
+
+// JSON path must enforce the same cap, and still return the header + status so
+// callers can diagnose the oversized response.
+func TestMaxResponseBytes_OverLimit_JSON(t *testing.T) {
+	payload, _ := json.Marshal(strings.Repeat("x", 1000))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Request-Id", "big")
+		_, _ = w.Write(payload)
+	}))
+	defer srv.Close()
+	c := New(WithHTTPClient(srv.Client()), WithMaxResponseBytes(100))
+
+	var s string
+	header, status, err := c.GetJSONWithHeader(t.Context(), srv.URL, nil, &s)
+	if !errors.Is(err, ErrResponseTooLarge) {
+		t.Fatalf("err = %v, want ErrResponseTooLarge", err)
+	}
+	if status != 200 {
+		t.Errorf("status = %d, want 200", status)
+	}
+	if header == nil || header.Get("X-Request-Id") != "big" {
+		t.Errorf("header lost on too-large error: %v", header)
+	}
+}
+
+// Limit 0 disables the cap entirely.
+func TestMaxResponseBytes_Unlimited(t *testing.T) {
+	srv := sizedServer(300000)
+	defer srv.Close()
+	c := New(WithHTTPClient(srv.Client()), WithMaxResponseBytes(0))
+
+	body, _, err := c.GetRaw(t.Context(), srv.URL, nil)
+	if err != nil || len(body) != 300000 {
+		t.Fatalf("err=%v len=%d", err, len(body))
+	}
+}
+
+// Negative values are normalized to "unlimited", never a tiny/zero accidental cap.
+func TestMaxResponseBytes_NegativeMeansUnlimited(t *testing.T) {
+	srv := sizedServer(5000)
+	defer srv.Close()
+	c := New(WithHTTPClient(srv.Client()), WithMaxResponseBytes(-1))
+
+	body, _, err := c.GetRaw(t.Context(), srv.URL, nil)
+	if err != nil || len(body) != 5000 {
+		t.Fatalf("err=%v len=%d", err, len(body))
+	}
+}
+
+// Default cap (10 MiB) must be in effect without any option.
+func TestMaxResponseBytes_DefaultApplied(t *testing.T) {
+	c := New()
+	if c.maxResponseBytes != defaultMaxResponseBytes {
+		t.Errorf("default = %d, want %d", c.maxResponseBytes, defaultMaxResponseBytes)
+	}
+}
+
+// --- Log redaction ---
+
+func TestDo_RedactsURLUserinfo(t *testing.T) {
+	srv := echoServer()
+	defer srv.Close()
+
+	lg := &kvLogger{}
+	c := New(WithHTTPClient(srv.Client()), WithLogger(lg))
+
+	u, _ := url.Parse(srv.URL)
+	u.User = url.UserPassword("alice", "s3cr3t-pass")
+
+	var r map[string]any
+	if _, err := c.GetJSON(t.Context(), u.String(), nil, &r); err != nil {
+		t.Fatal(err)
+	}
+
+	dump := lg.dump()
+	if strings.Contains(dump, "s3cr3t-pass") {
+		t.Errorf("password leaked into logs:\n%s", dump)
+	}
+	if !strings.Contains(dump, "xxxxx") {
+		t.Errorf("expected redaction marker xxxxx, got:\n%s", dump)
+	}
+}
+
+// --- Bounded drain must not break connection reuse for normal-sized bodies ---
+
+func TestConnectionReuse(t *testing.T) {
+	var newConns int32
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			atomic.AddInt32(&newConns, 1)
+		}
+	}
+	srv.Start()
+	defer srv.Close()
+
+	c := New(WithHTTPClient(srv.Client()))
+	for range 5 {
+		var r map[string]bool
+		if _, err := c.GetJSON(t.Context(), srv.URL, nil, &r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := atomic.LoadInt32(&newConns); n != 1 {
+		t.Errorf("opened %d connections, want 1 (connection reuse broken)", n)
 	}
 }
 

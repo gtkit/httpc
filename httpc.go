@@ -18,6 +18,7 @@ package httpc
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -32,7 +33,18 @@ const (
 	defaultMaxIdleConns        = 100
 	defaultMaxIdleConnsPerHost = 10
 	defaultIdleConnTimeout     = 90 * time.Second
+	// defaultMaxResponseBytes caps response body reads to guard against memory
+	// exhaustion from oversized or malicious responses. Override with
+	// [WithMaxResponseBytes].
+	defaultMaxResponseBytes = 10 << 20 // 10 MiB
+	// drainLimit caps how many leftover body bytes are drained for connection
+	// reuse, so an attacker-controlled body cannot force an unbounded read.
+	drainLimit = 4 << 10 // 4 KiB
 )
+
+// ErrResponseTooLarge is returned (wrapped) when a response body exceeds the
+// configured maximum. See [WithMaxResponseBytes]. Detect it with [errors.Is].
+var ErrResponseTooLarge = errors.New("httpc: response body exceeds limit")
 
 // Logger defines a minimal structured logging interface.
 //
@@ -61,8 +73,9 @@ func (NopLogger) Error(string, ...any) {}
 // Client is a concurrency-safe HTTP client optimized for JSON APIs.
 // All fields are read-only after construction — safe to share across goroutines.
 type Client struct {
-	http   *http.Client
-	logger Logger
+	http             *http.Client
+	logger           Logger
+	maxResponseBytes int64
 }
 
 // Option configures a [Client].
@@ -71,8 +84,9 @@ type Option func(*Client)
 // New creates a new [Client] with production-grade defaults.
 func New(opts ...Option) *Client {
 	c := &Client{
-		http:   newDefaultHTTPClient(defaultTimeout),
-		logger: NopLogger{},
+		http:             newDefaultHTTPClient(defaultTimeout),
+		logger:           NopLogger{},
+		maxResponseBytes: defaultMaxResponseBytes,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -158,11 +172,27 @@ func (c *Client) DeleteJSONWithHeader(ctx context.Context, url string, body any,
 // GetRaw sends GET and returns the raw response body bytes.
 // Useful when the response needs multiple unmarshal passes.
 func (c *Client) GetRaw(ctx context.Context, url string, headers map[string]string) ([]byte, int, error) {
-	return c.doRequestRaw(ctx, http.MethodGet, url, headers, nil)
+	_, data, status, err := c.doRequestRaw(ctx, http.MethodGet, url, headers, nil)
+	return data, status, err
 }
 
 // PostRaw sends POST with a JSON body and returns raw response bytes.
 func (c *Client) PostRaw(ctx context.Context, url string, body any) ([]byte, int, error) {
+	_, data, status, err := c.doRequestRaw(ctx, http.MethodPost, url, nil, body)
+	return data, status, err
+}
+
+// --- Raw response methods returning response headers ---
+
+// GetRawWithHeader sends GET and returns the raw response body together with the
+// response headers. See the *WithHeader JSON methods for header semantics.
+func (c *Client) GetRawWithHeader(ctx context.Context, url string, headers map[string]string) (http.Header, []byte, int, error) {
+	return c.doRequestRaw(ctx, http.MethodGet, url, headers, nil)
+}
+
+// PostRawWithHeader sends POST with a JSON body and returns the raw response body
+// together with the response headers.
+func (c *Client) PostRawWithHeader(ctx context.Context, url string, body any) (http.Header, []byte, int, error) {
 	return c.doRequestRaw(ctx, http.MethodPost, url, nil, body)
 }
 
@@ -188,6 +218,13 @@ func (c *Client) RequestJSONWithHeader(ctx context.Context, method, url string, 
 // RequestRaw sends any HTTP method with custom headers and optional JSON body,
 // returns raw response bytes.
 func (c *Client) RequestRaw(ctx context.Context, method, url string, headers map[string]string, body any) ([]byte, int, error) {
+	_, data, status, err := c.doRequestRaw(ctx, method, url, headers, body)
+	return data, status, err
+}
+
+// RequestRawWithHeader sends any HTTP method with custom headers and optional
+// JSON body, returning the raw response body together with the response headers.
+func (c *Client) RequestRawWithHeader(ctx context.Context, method, url string, headers map[string]string, body any) (http.Header, []byte, int, error) {
 	return c.doRequestRaw(ctx, method, url, headers, body)
 }
 
@@ -197,18 +234,22 @@ func (c *Client) RequestRaw(ctx context.Context, method, url string, headers map
 // The caller is responsible for closing the response body.
 // Prefer the higher-level methods unless you need full control.
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
+	// Redacted() masks any userinfo password embedded in the URL so credentials
+	// do not leak into logs. NOTE: secrets passed as query parameters are still
+	// logged — prefer headers for tokens.
+	safeURL := req.URL.Redacted()
 	c.logger.Debug("httpc: request",
-		"method", req.Method, "url", req.URL.String(),
+		"method", req.Method, "url", safeURL,
 	)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		c.logger.Error("httpc: request failed",
-			"method", req.Method, "url", req.URL.String(), "error", err.Error(),
+			"method", req.Method, "url", safeURL, "error", err.Error(),
 		)
-		return nil, fmt.Errorf("httpc: %s %s: %w", req.Method, req.URL.String(), err)
+		return nil, fmt.Errorf("httpc: %s %s: %w", req.Method, safeURL, err)
 	}
 	c.logger.Info("httpc: response",
-		"method", req.Method, "url", req.URL.String(),
+		"method", req.Method, "url", safeURL,
 		"status", resp.StatusCode,
 	)
 	return resp, nil
@@ -276,42 +317,85 @@ func (c *Client) doRequestJSON(ctx context.Context, method, url string, headers 
 	}
 	defer drainAndClose(resp.Body)
 
-	if result != nil {
-		if err := json.NewDecoder(resp.Body).Decode(result); err != nil {
-			c.logger.Warn("httpc: decode response failed",
-				"method", method, "url", url,
-				"status", resp.StatusCode, "error", err.Error(),
-			)
-			return resp.Header, resp.StatusCode, fmt.Errorf("httpc: decode response: %w", err)
-		}
+	// Fire-and-forget: no decode target, so skip reading the body entirely and
+	// let the deferred drain reclaim the connection.
+	if result == nil {
+		return resp.Header, resp.StatusCode, nil
+	}
+
+	data, err := c.readBody(resp.Body)
+	if err != nil {
+		c.logger.Warn("httpc: read response failed",
+			"method", method, "url", url,
+			"status", resp.StatusCode, "error", err.Error(),
+		)
+		return resp.Header, resp.StatusCode, err
+	}
+	if err := json.Unmarshal(data, result); err != nil {
+		c.logger.Warn("httpc: decode response failed",
+			"method", method, "url", url,
+			"status", resp.StatusCode, "error", err.Error(),
+		)
+		return resp.Header, resp.StatusCode, fmt.Errorf("httpc: decode response: %w", err)
 	}
 	return resp.Header, resp.StatusCode, nil
 }
 
 // doRequestRaw builds, executes, and returns the raw response body.
-func (c *Client) doRequestRaw(ctx context.Context, method, url string, headers map[string]string, body any) ([]byte, int, error) {
+func (c *Client) doRequestRaw(ctx context.Context, method, url string, headers map[string]string, body any) (http.Header, []byte, int, error) {
 	req, err := c.buildRequest(ctx, method, url, headers, body)
 	if err != nil {
-		return nil, 0, err
+		return nil, nil, 0, err
 	}
 
 	resp, err := c.Do(req)
 	if err != nil {
-		return nil, 0, err
+		return nil, nil, 0, err
 	}
 	defer drainAndClose(resp.Body)
 
-	data, err := io.ReadAll(resp.Body)
+	data, err := c.readBody(resp.Body)
 	if err != nil {
-		return nil, resp.StatusCode, fmt.Errorf("httpc: read body: %w", err)
+		c.logger.Warn("httpc: read response failed",
+			"method", method, "url", url,
+			"status", resp.StatusCode, "error", err.Error(),
+		)
+		return resp.Header, nil, resp.StatusCode, err
 	}
-	return data, resp.StatusCode, nil
+	return resp.Header, data, resp.StatusCode, nil
 }
 
-// drainAndClose fully consumes and closes the body for connection reuse.
+// readBody reads the response body, honoring the configured size cap. It returns
+// an error wrapping [ErrResponseTooLarge] when the body exceeds the limit
+// (maxResponseBytes <= 0 disables the cap). The +1 over the limit lets us
+// distinguish "exactly at the limit" (allowed) from "over the limit" (rejected).
+func (c *Client) readBody(r io.Reader) ([]byte, error) {
+	limit := c.maxResponseBytes
+	if limit <= 0 {
+		data, err := io.ReadAll(r)
+		if err != nil {
+			return nil, fmt.Errorf("httpc: read body: %w", err)
+		}
+		return data, nil
+	}
+
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, fmt.Errorf("httpc: read body: %w", err)
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("%w (max %d bytes)", ErrResponseTooLarge, limit)
+	}
+	return data, nil
+}
+
+// drainAndClose consumes up to drainLimit leftover body bytes so the connection
+// can be reused, then closes it. The cap prevents an oversized or malicious
+// body from forcing an unbounded read just to recycle a connection; if more
+// than drainLimit remains, the connection is simply not reused.
 func drainAndClose(r io.ReadCloser) {
-	_, _ = io.Copy(io.Discard, r)
-	r.Close()
+	_, _ = io.CopyN(io.Discard, r, drainLimit)
+	_ = r.Close()
 }
 
 // --- Options ---
@@ -348,6 +432,19 @@ func WithTimeout(d time.Duration) Option {
 		if d > 0 {
 			c.http.Timeout = d
 		}
+	}
+}
+
+// WithMaxResponseBytes caps how many response body bytes httpc reads, guarding
+// against memory exhaustion from oversized or malicious responses. The default
+// is 10 MiB. Pass 0 (or a negative value) to disable the limit. When a body
+// exceeds the cap, JSON/Raw methods return an error wrapping [ErrResponseTooLarge].
+func WithMaxResponseBytes(n int64) Option {
+	return func(c *Client) {
+		if n < 0 {
+			n = 0
+		}
+		c.maxResponseBytes = n
 	}
 }
 

@@ -13,10 +13,12 @@ go get github.com/gtkit/httpc
 ## 特性
 
 - **全 HTTP 方法**: GET / POST / PUT / PATCH / DELETE / HEAD / OPTIONS + 通用 `RequestJSON`
-- **响应 Header 透出**: `*WithHeader` 变体返回 `(http.Header, int, error)`，便于读取 `X-Request-Id`/`ETag` 等
+- **响应 Header 透出**: JSON 与 Raw 方法均提供 `*WithHeader` 变体，便于读取 `X-Request-Id`/`ETag` 等
+- **响应体限流**: 默认上限 10 MiB（`WithMaxResponseBytes` 可调），防止超大/恶意响应打爆内存
 - **JSON 编解码**: 使用 `github.com/gtkit/json/v2`，构建时可切换 sonic/go-json/jsoniter
 - **连接池**: MaxIdleConns=100, MaxIdleConnsPerHost=10, HTTP/2, KeepAlive
-- **Body drain**: 自动排空响应体确保连接复用
+- **安全 Body drain**: 限量排空（≤4 KiB）以复用连接，避免被恶意 body 拖垮
+- **日志脱敏**: 日志中的 URL 自动屏蔽 userinfo 密码（token 请放 header，勿放 query）
 - **Redirect 控制**: 默认跟随 3xx，也可禁用自动跳转或自定义跳转策略
 - **结构化日志**: 每次请求/响应/错误都会通过 `Logger` 接口记录
 - **Context 传播**: 所有方法第一个参数都是 `context.Context`
@@ -54,6 +56,13 @@ header, status, err := c.GetJSONWithHeader(ctx, url, nil, &result)
 reqID := header.Get("X-Request-Id")
 // 同样提供 Post/Put/Patch/Delete 及通用 RequestJSONWithHeader
 header, status, err = c.RequestJSONWithHeader(ctx, "GET", url, headers, nil, &result)
+// Raw 路径也有对称变体（返回 http.Header, []byte, status, err）
+header, body, status, err = c.GetRawWithHeader(ctx, url, nil)
+
+// 限制响应体大小（默认 10 MiB），超限返回 errors.Is(err, httpc.ErrResponseTooLarge)
+c = httpc.New(httpc.WithMaxResponseBytes(5 << 20)) // 5 MiB
+// 传 0 关闭限制（仅在完全可信的内网场景使用）
+c = httpc.New(httpc.WithMaxResponseBytes(0))
 
 // HEAD
 resp, err := c.Head(ctx, url, nil)

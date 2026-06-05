@@ -4,8 +4,9 @@
 //   - All standard HTTP methods (GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS)
 //   - JSON encode/decode via [github.com/gtkit/json/v2] (build-tag swappable backend)
 //   - Connection pooling, keep-alive, HTTP/2
-//   - Body draining for connection reuse
-//   - Structured logging at every request lifecycle stage
+//   - Bounded body draining for connection reuse
+//   - Response body size cap to guard against memory exhaustion
+//   - Optional debug logging (requests) and error logging (transport failures)
 //   - Context propagation and cancellation
 //
 // Quick start:
@@ -46,7 +47,20 @@ const (
 // configured maximum. See [WithMaxResponseBytes]. Detect it with [errors.Is].
 var ErrResponseTooLarge = errors.New("httpc: response body exceeds limit")
 
+// ErrEmptyBody is returned by the JSON convenience methods when the server sends
+// an empty (or whitespace-only) response body but a decode target was provided.
+// It lets callers distinguish "no content" (e.g. 204, an empty 502) from
+// malformed JSON. Detect it with [errors.Is]. Use the Raw methods if an empty
+// body is expected and should not be treated as an error.
+var ErrEmptyBody = errors.New("httpc: empty response body")
+
 // Logger defines a minimal structured logging interface.
+//
+// httpc keeps internal logging deliberately sparse to avoid duplicating what
+// callers already log from return values: it emits Debug for each outgoing
+// request (and for read/decode/empty-body diagnostics) and Error only on
+// transport failures. The Info and Warn methods are part of the interface for
+// adapter completeness but are not currently called by httpc.
 //
 // Implement this to integrate with zap, slog, zerolog, or gtkit/logger:
 //
@@ -248,10 +262,6 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 		)
 		return nil, fmt.Errorf("httpc: %s %s: %w", req.Method, safeURL, err)
 	}
-	c.logger.Info("httpc: response",
-		"method", req.Method, "url", safeURL,
-		"status", resp.StatusCode,
-	)
 	return resp, nil
 }
 
@@ -325,14 +335,22 @@ func (c *Client) doRequestJSON(ctx context.Context, method, url string, headers 
 
 	data, err := c.readBody(resp.Body)
 	if err != nil {
-		c.logger.Warn("httpc: read response failed",
+		c.logger.Debug("httpc: read response failed",
 			"method", method, "url", url,
 			"status", resp.StatusCode, "error", err.Error(),
 		)
 		return resp.Header, resp.StatusCode, err
 	}
+	// Decouple transport from decoding: surface an empty body as a distinct
+	// sentinel so callers can tell "no content" apart from malformed JSON.
+	if len(bytes.TrimSpace(data)) == 0 {
+		c.logger.Debug("httpc: empty response body",
+			"method", method, "url", url, "status", resp.StatusCode,
+		)
+		return resp.Header, resp.StatusCode, ErrEmptyBody
+	}
 	if err := json.Unmarshal(data, result); err != nil {
-		c.logger.Warn("httpc: decode response failed",
+		c.logger.Debug("httpc: decode response failed",
 			"method", method, "url", url,
 			"status", resp.StatusCode, "error", err.Error(),
 		)
@@ -356,7 +374,7 @@ func (c *Client) doRequestRaw(ctx context.Context, method, url string, headers m
 
 	data, err := c.readBody(resp.Body)
 	if err != nil {
-		c.logger.Warn("httpc: read response failed",
+		c.logger.Debug("httpc: read response failed",
 			"method", method, "url", url,
 			"status", resp.StatusCode, "error", err.Error(),
 		)

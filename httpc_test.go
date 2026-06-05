@@ -211,12 +211,13 @@ func TestGetJSON(t *testing.T) {
 		t.Errorf("auth = %v", result["auth"])
 	}
 
-	// Verify logger was called
+	// Verify the request was logged at Debug. httpc no longer emits a per-response
+	// Info log (slimmed to Debug+Error to avoid duplicating caller-side logging).
 	if !logger.has("httpc: request") {
 		t.Error("logger.Debug not called for request")
 	}
-	if !logger.has("httpc: response") {
-		t.Error("logger.Info not called for response")
+	if logger.has("httpc: response") {
+		t.Error("per-response Info log should have been removed")
 	}
 }
 
@@ -885,6 +886,113 @@ func TestMaxResponseBytes_DefaultApplied(t *testing.T) {
 	c := New()
 	if c.maxResponseBytes != defaultMaxResponseBytes {
 		t.Errorf("default = %d, want %d", c.maxResponseBytes, defaultMaxResponseBytes)
+	}
+}
+
+// --- ErrEmptyBody ---
+
+func TestGetJSON_EmptyBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200) // 200 with no body
+	}))
+	defer srv.Close()
+	c := New(WithHTTPClient(srv.Client()))
+
+	var result map[string]any
+	status, err := c.GetJSON(t.Context(), srv.URL, nil, &result)
+	if !errors.Is(err, ErrEmptyBody) {
+		t.Fatalf("err = %v, want ErrEmptyBody", err)
+	}
+	if status != 200 {
+		t.Errorf("status = %d, want 200", status)
+	}
+}
+
+func TestGetJSON_WhitespaceOnlyBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("  \n\t  "))
+	}))
+	defer srv.Close()
+	c := New(WithHTTPClient(srv.Client()))
+
+	var result map[string]any
+	_, err := c.GetJSON(t.Context(), srv.URL, nil, &result)
+	if !errors.Is(err, ErrEmptyBody) {
+		t.Fatalf("err = %v, want ErrEmptyBody", err)
+	}
+}
+
+// An empty body and malformed JSON must be distinguishable.
+func TestEmptyBody_DistinctFromDecodeError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("not json"))
+	}))
+	defer srv.Close()
+	c := New(WithHTTPClient(srv.Client()))
+
+	var result map[string]any
+	_, err := c.GetJSON(t.Context(), srv.URL, nil, &result)
+	if err == nil {
+		t.Fatal("expected decode error")
+	}
+	if errors.Is(err, ErrEmptyBody) {
+		t.Error("malformed JSON misclassified as ErrEmptyBody")
+	}
+}
+
+// On an empty body the header and status must still be returned for diagnostics.
+func TestGetJSONWithHeader_EmptyBody_ReturnsHeader(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Request-Id", "empty-1")
+		w.WriteHeader(502)
+	}))
+	defer srv.Close()
+	c := New(WithHTTPClient(srv.Client()))
+
+	var result map[string]any
+	header, status, err := c.GetJSONWithHeader(t.Context(), srv.URL, nil, &result)
+	if !errors.Is(err, ErrEmptyBody) {
+		t.Fatalf("err = %v, want ErrEmptyBody", err)
+	}
+	if status != 502 {
+		t.Errorf("status = %d, want 502", status)
+	}
+	if header == nil || header.Get("X-Request-Id") != "empty-1" {
+		t.Errorf("header lost on empty body: %v", header)
+	}
+}
+
+// Fire-and-forget (result == nil) must not raise ErrEmptyBody.
+func TestEmptyBody_NilResult_NoError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(204)
+	}))
+	defer srv.Close()
+	c := New(WithHTTPClient(srv.Client()))
+
+	status, err := c.PostJSON(t.Context(), srv.URL, map[string]string{"a": "b"}, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if status != 204 {
+		t.Errorf("status = %d, want 204", status)
+	}
+}
+
+// Raw methods must NOT treat an empty body as an error (no decoding involved).
+func TestGetRaw_EmptyBody_NoError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(204)
+	}))
+	defer srv.Close()
+	c := New(WithHTTPClient(srv.Client()))
+
+	body, status, err := c.GetRaw(t.Context(), srv.URL, nil)
+	if err != nil {
+		t.Fatalf("raw empty body should not error: %v", err)
+	}
+	if status != 204 || len(body) != 0 {
+		t.Errorf("status=%d len=%d", status, len(body))
 	}
 }
 

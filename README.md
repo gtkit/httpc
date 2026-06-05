@@ -77,6 +77,8 @@ body, status, err := c.GetRaw(ctx, url, nil)
 
 ## Logger 集成
 
+httpc 的内部日志刻意保持克制，避免与调用方基于返回值的日志重复：**仅** 对每个请求记 `Debug`、对传输错误记 `Error`（读/解码/空 body 等诊断也走 `Debug`）。`Info`/`Warn` 仍在接口里以便 adapter 完整实现，但 httpc 不会调用。状态码、Header、错误都通过返回值给到调用方，请在业务层带上下文记录。
+
 ```go
 type zapLogger struct{ l *zap.SugaredLogger }
 func (z *zapLogger) Debug(msg string, kv ...any) { z.l.Debugw(msg, kv...) }
@@ -89,8 +91,18 @@ c := httpc.New(httpc.WithLogger(&zapLogger{l: zap.S()}))
 
 日志输出示例：
 ```
-DEBUG httpc: request  method=POST url=https://api.example.com/token
-INFO  httpc: response method=POST url=https://api.example.com/token status=200
+DEBUG httpc: request method=POST url=https://api.example.com/token
+ERROR httpc: request failed method=POST url=... error=dial tcp ...
+```
+
+## 空 body 与状态码
+
+JSON 便捷方法遇到空（或纯空白）响应体且传了 `result` 时，返回 `httpc.ErrEmptyBody`（用 `errors.Is` 判断），以区分「无内容」与「坏 JSON」。需要自行掌控状态码语义、错误信封或拿 Header 时，用 Raw 变体（不解码）：
+
+```go
+header, body, status, err := c.GetRawWithHeader(ctx, url, nil)
+if err != nil { return err }            // 仅传输/读 body 错误
+if status >= 400 { /* 自行处理错误信封 */ }
 ```
 
 ## JSON 后端切换

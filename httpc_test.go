@@ -3,6 +3,7 @@ package httpc
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -975,5 +976,308 @@ func TestConnectionReuse(t *testing.T) {
 	}
 	if n := atomic.LoadInt32(&newConns); n != 1 {
 		t.Errorf("opened %d connections, want 1 (connection reuse broken)", n)
+	}
+}
+
+// --- Default transport must honor proxy environment variables ---
+
+func TestDefaultTransport_ProxyFromEnvironment(t *testing.T) {
+	tr, ok := New().HTTPClient().Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("default transport is not *http.Transport")
+	}
+	if tr.Proxy == nil {
+		t.Error("default transport ignores HTTP_PROXY/HTTPS_PROXY (Proxy is nil)")
+	}
+}
+
+// --- WithHTTPClient must not mutate the caller's client ---
+
+func TestWithHTTPClient_DoesNotMutateCaller(t *testing.T) {
+	shared := &http.Client{Timeout: 3 * time.Second}
+
+	c := New(WithHTTPClient(shared), WithTimeout(30*time.Second), WithoutRedirect())
+
+	if shared.Timeout != 3*time.Second {
+		t.Errorf("caller's client Timeout mutated to %v", shared.Timeout)
+	}
+	if shared.CheckRedirect != nil {
+		t.Error("caller's client CheckRedirect mutated")
+	}
+	if c.http.Timeout != 30*time.Second {
+		t.Errorf("httpc client Timeout = %v, want 30s", c.http.Timeout)
+	}
+}
+
+// --- Typed-nil body must behave like no body, not the JSON literal "null" ---
+
+func TestBuildRequest_TypedNilBody(t *testing.T) {
+	type payload struct{ Name string }
+
+	var mu sync.Mutex
+	var gotBody string
+	var gotContentType string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		data, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		gotBody = string(data)
+		gotContentType = r.Header.Get("Content-Type")
+		mu.Unlock()
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	c := New(WithHTTPClient(srv.Client()))
+
+	var nilPtr *payload // typed nil stored in any
+	var result map[string]bool
+	if _, err := c.PostJSON(t.Context(), srv.URL, nilPtr, &result); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	if gotBody != "" {
+		t.Errorf("typed-nil body sent %q, want empty", gotBody)
+	}
+	if gotContentType != "" {
+		t.Errorf("typed-nil body set Content-Type %q, want unset", gotContentType)
+	}
+	mu.Unlock()
+
+	// A real body must still be sent as before.
+	if _, err := c.PostJSON(t.Context(), srv.URL, payload{Name: "x"}, &result); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	if gotBody == "" || gotContentType != "application/json" {
+		t.Errorf("real body: got body %q content-type %q", gotBody, gotContentType)
+	}
+	mu.Unlock()
+}
+
+func TestIsNilValue(t *testing.T) {
+	type foo struct{}
+	var p *foo
+	var m map[string]int
+	var s []int
+
+	for _, tc := range []struct {
+		name string
+		v    any
+		want bool
+	}{
+		{"untyped nil", nil, true},
+		{"typed nil pointer", p, true},
+		{"nil map", m, true},
+		{"nil slice", s, true},
+		{"non-nil pointer", &foo{}, false},
+		{"struct", foo{}, false},
+		{"string", "x", false},
+		{"int", 0, false},
+		// A nil func is NOT treated as "no body": it must reach json.Marshal
+		// and fail loudly, surfacing the caller's type mistake.
+		{"nil func", (func())(nil), false},
+	} {
+		if got := isNilValue(tc.v); got != tc.want {
+			t.Errorf("%s: isNilValue = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// --- WithMaxIdleConnsPerHost ---
+
+func TestWithMaxIdleConnsPerHost(t *testing.T) {
+	c := New(WithMaxIdleConnsPerHost(50))
+	tr, ok := c.HTTPClient().Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("transport is not *http.Transport")
+	}
+	if tr.MaxIdleConnsPerHost != 50 {
+		t.Errorf("MaxIdleConnsPerHost = %d, want 50", tr.MaxIdleConnsPerHost)
+	}
+
+	// Non-positive values keep the default.
+	c = New(WithMaxIdleConnsPerHost(0))
+	tr, ok = c.HTTPClient().Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("transport is not *http.Transport")
+	}
+	if tr.MaxIdleConnsPerHost != defaultMaxIdleConnsPerHost {
+		t.Errorf("MaxIdleConnsPerHost = %d, want default %d", tr.MaxIdleConnsPerHost, defaultMaxIdleConnsPerHost)
+	}
+}
+
+func TestWithMaxIdleConnsPerHost_DoesNotMutateSharedTransport(t *testing.T) {
+	sharedTransport := &http.Transport{MaxIdleConnsPerHost: 7}
+	shared := &http.Client{Transport: sharedTransport}
+
+	c := New(WithHTTPClient(shared), WithMaxIdleConnsPerHost(50))
+
+	if sharedTransport.MaxIdleConnsPerHost != 7 {
+		t.Errorf("caller's transport mutated to %d, want 7", sharedTransport.MaxIdleConnsPerHost)
+	}
+	tr, ok := c.HTTPClient().Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("transport is not *http.Transport")
+	}
+	if tr.MaxIdleConnsPerHost != 50 {
+		t.Errorf("cloned transport MaxIdleConnsPerHost = %d, want 50", tr.MaxIdleConnsPerHost)
+	}
+}
+
+func TestWithMaxIdleConnsPerHost_NilTransport(t *testing.T) {
+	// A client with a nil Transport effectively uses http.DefaultTransport;
+	// the option must still take effect (on a clone) instead of no-opping.
+	c := New(WithHTTPClient(&http.Client{}), WithMaxIdleConnsPerHost(50))
+
+	tr, ok := c.HTTPClient().Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("transport is not *http.Transport")
+	}
+	if tr.MaxIdleConnsPerHost != 50 {
+		t.Errorf("MaxIdleConnsPerHost = %d, want 50", tr.MaxIdleConnsPerHost)
+	}
+	if dt := http.DefaultTransport.(*http.Transport); dt.MaxIdleConnsPerHost == 50 {
+		t.Error("http.DefaultTransport was mutated")
+	}
+}
+
+// --- WithBaseURL ---
+
+func TestWithBaseURL(t *testing.T) {
+	var mu sync.Mutex
+	var gotPath, gotQuery string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		gotPath = r.URL.Path
+		gotQuery = r.URL.RawQuery
+		mu.Unlock()
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	c := New(WithBaseURL(srv.URL + "/")) // trailing slash must be trimmed
+
+	for _, tc := range []struct {
+		name      string
+		url       string
+		wantPath  string
+		wantQuery string
+	}{
+		{"leading slash", "/v1/users", "/v1/users", ""},
+		{"no leading slash", "v1/users", "/v1/users", ""},
+		{"query string preserved", "/v1/users?id=1&x=y", "/v1/users", "id=1&x=y"},
+		{"empty path hits base", "", "/", ""},
+	} {
+		var result map[string]bool
+		if _, err := c.GetJSON(t.Context(), tc.url, nil, &result); err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		mu.Lock()
+		if gotPath != tc.wantPath || gotQuery != tc.wantQuery {
+			t.Errorf("%s: got path %q query %q, want %q %q", tc.name, gotPath, gotQuery, tc.wantPath, tc.wantQuery)
+		}
+		mu.Unlock()
+	}
+
+	// An absolute URL bypasses the base entirely.
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"other":true}`))
+	}))
+	defer other.Close()
+
+	var result map[string]bool
+	if _, err := c.GetJSON(t.Context(), other.URL+"/abs", nil, &result); err != nil {
+		t.Fatal(err)
+	}
+	if !result["other"] {
+		t.Error("absolute URL did not bypass the base URL")
+	}
+}
+
+func TestWithBaseURL_UnsetKeepsURLAsIs(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	var result map[string]bool
+	if _, err := New().GetJSON(t.Context(), srv.URL+"/x", nil, &result); err != nil {
+		t.Fatal(err)
+	}
+	if !result["ok"] {
+		t.Error("request without base URL failed")
+	}
+}
+
+// --- WithDefaultHeaders ---
+
+func TestWithDefaultHeaders(t *testing.T) {
+	var mu sync.Mutex
+	got := map[string]string{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		got["auth"] = r.Header.Get("Authorization")
+		got["ua"] = r.Header.Get("User-Agent")
+		got["accept"] = r.Header.Get("Accept")
+		mu.Unlock()
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	defaults := map[string]string{
+		"Authorization": "Bearer default-token",
+		"User-Agent":    "my-service/1.0",
+	}
+	c := New(WithDefaultHeaders(defaults))
+
+	// Defaults are applied when the call passes no headers.
+	var result map[string]bool
+	if _, err := c.GetJSON(t.Context(), srv.URL, nil, &result); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	if got["auth"] != "Bearer default-token" || got["ua"] != "my-service/1.0" {
+		t.Errorf("defaults not applied: %v", got)
+	}
+	if got["accept"] != "application/json" {
+		t.Errorf("Accept = %q, want application/json", got["accept"])
+	}
+	mu.Unlock()
+
+	// A per-call header overrides the default with the same name.
+	if _, err := c.GetJSON(t.Context(), srv.URL, map[string]string{
+		"Authorization": "Bearer per-call",
+	}, &result); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	if got["auth"] != "Bearer per-call" {
+		t.Errorf("per-call override failed: auth = %q", got["auth"])
+	}
+	if got["ua"] != "my-service/1.0" {
+		t.Errorf("unrelated default dropped: ua = %q", got["ua"])
+	}
+	mu.Unlock()
+
+	// Mutating the caller's map after New must not affect the client.
+	defaults["Authorization"] = "Bearer mutated"
+	if _, err := c.GetJSON(t.Context(), srv.URL, nil, &result); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	if got["auth"] != "Bearer default-token" {
+		t.Errorf("caller map mutation leaked: auth = %q", got["auth"])
+	}
+	mu.Unlock()
+}
+
+func TestWithDefaultHeaders_MergeAndNil(t *testing.T) {
+	c := New(
+		WithDefaultHeaders(map[string]string{"A": "1"}),
+		WithDefaultHeaders(map[string]string{"B": "2"}),
+		WithDefaultHeaders(nil),
+	)
+	if c.defaultHeaders["A"] != "1" || c.defaultHeaders["B"] != "2" {
+		t.Errorf("merge failed: %v", c.defaultHeaders)
 	}
 }

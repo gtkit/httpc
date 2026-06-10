@@ -13,10 +13,12 @@ go get github.com/gtkit/httpc
 ## 特性
 
 - **全 HTTP 方法**: GET / POST / PUT / PATCH / DELETE / HEAD / OPTIONS + 通用 `RequestJSON`
+- **BaseURL 与默认 Header**: `WithBaseURL` 调用处只传路径；`WithDefaultHeaders` 公共头设一次，单次调用可覆盖
 - **响应 Header 透出**: JSON 与 Raw 方法均提供 `*WithHeader` 变体，便于读取 `X-Request-Id`/`ETag` 等
 - **响应体限流**: 默认上限 10 MiB（`WithMaxResponseBytes` 可调），防止超大/恶意响应打爆内存
 - **JSON 编解码**: 使用 `github.com/gtkit/json/v2`，构建时可切换 sonic/go-json/jsoniter
-- **连接池**: MaxIdleConns=100, MaxIdleConnsPerHost=10, HTTP/2, KeepAlive
+- **连接池**: MaxIdleConns=100, MaxIdleConnsPerHost=10（`WithMaxIdleConnsPerHost` 可调）, HTTP/2, KeepAlive
+- **代理支持**: 默认读取 `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` 环境变量
 - **安全 Body drain**: 限量排空（≤4 KiB）以复用连接，避免被恶意 body 拖垮
 - **Redirect 控制**: 默认跟随 3xx，也可禁用自动跳转或自定义跳转策略
 - **无内置日志**: 状态码/Header/错误全部回传，由调用方在业务层记录（错误信息自动屏蔽 URL 中的 userinfo 密码）
@@ -28,6 +30,17 @@ go get github.com/gtkit/httpc
 c := httpc.New(
     httpc.WithTimeout(10 * time.Second),
 )
+
+// BaseURL + 全局默认 Header：调用处只传路径，公共头只设一次
+c = httpc.New(
+    httpc.WithBaseURL("https://api.example.com"),
+    httpc.WithDefaultHeaders(map[string]string{
+        "Authorization": "Bearer xxx",
+        "User-Agent":    "my-service/1.0",
+    }),
+)
+status, err := c.GetJSON(ctx, "/v1/users?id=1", nil, &result) // 实际请求 https://api.example.com/v1/users?id=1
+// 单次调用传同名 header 可覆盖默认值；URL 自带 scheme 时绕过 BaseURL 直接使用
 
 // JSON POST
 var result MyResponse
@@ -71,7 +84,20 @@ c.PostJSON(ctx, url, body, nil)
 // 禁止自动跟随 3xx，直接读取 Location / status
 c = httpc.New(httpc.WithoutRedirect())
 body, status, err := c.GetRaw(ctx, url, nil)
+
+// 主要请求单一上游时，调大每 host 的空闲连接数（默认 10）。
+// 该选项会先克隆 transport 再修改，不会改写共享的 transport（代价是独立连接池）
+c = httpc.New(httpc.WithMaxIdleConnsPerHost(50))
+
+// 自定义 http.Client：会浅拷贝，后续选项不会改写你传入的 client；
+// 反过来，构造之后你再修改自己的 client 也不会影响 httpc。
+// 注意 WithHTTPClient 要放在 WithTimeout 等修改型选项之前。
+c = httpc.New(httpc.WithHTTPClient(myClient), httpc.WithTimeout(5*time.Second))
 ```
+
+行为说明：body 传 `nil`（包括存进 `any` 的 typed-nil 指针/map/slice）时不发送请求体、不设置 `Content-Type`，而不是发送 JSON 字面量 `null`。如需显式发送 `null`，请传 `json.RawMessage("null")`。
+
+注意：重试有意不内置 —— 只有调用方知道哪些请求幂等、该用什么退避策略。请求体支持重放（`GetBody` 已设置），调用方可安全地重发。
 
 ## 日志（由调用方负责）
 

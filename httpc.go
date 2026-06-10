@@ -2,12 +2,22 @@
 //
 // Features:
 //   - All standard HTTP methods (GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS)
+//   - Base URL and client-wide default headers ([WithBaseURL], [WithDefaultHeaders])
 //   - JSON encode/decode via [github.com/gtkit/json/v2] (build-tag swappable backend)
 //   - Connection pooling, keep-alive, HTTP/2
 //   - Bounded body draining for connection reuse
 //   - Response body size cap to guard against memory exhaustion
-//   - Optional debug logging (requests) and error logging (transport failures)
+//   - No built-in logging: every outcome (status, headers, error) is returned
+//     to the caller, who logs with full business context
 //   - Context propagation and cancellation
+//
+// A nil request body — including a typed nil pointer, map, or slice stored in
+// the any parameter — sends no body and no Content-Type, rather than the JSON
+// literal "null".
+//
+// Retries are intentionally left to the caller: only the caller knows which
+// requests are idempotent and what backoff policy fits. Request bodies are
+// replayable (GetBody is set), so a caller-side retry can resend safely.
 //
 // Quick start:
 //
@@ -22,8 +32,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
+	"reflect"
+	"strings"
 	"time"
 
 	"github.com/gtkit/json/v2"
@@ -64,9 +77,13 @@ var ErrEmptyBody = errors.New("httpc: empty response body")
 type Client struct {
 	http             *http.Client
 	maxResponseBytes int64
+	baseURL          string
+	defaultHeaders   map[string]string
 }
 
-// Option configures a [Client].
+// Option configures a [Client]. Options are applied in the order given;
+// [WithHTTPClient] replaces the underlying client wholesale, so list it before
+// mutating options such as [WithTimeout] or [WithCheckRedirect].
 type Option func(*Client)
 
 // New creates a new [Client] with production-grade defaults.
@@ -232,6 +249,9 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 }
 
 // Head sends a HEAD request and returns the response headers.
+//
+// The returned response's Body has already been drained and closed — read
+// resp.Header and resp.StatusCode only; reading resp.Body returns an error.
 func (c *Client) Head(ctx context.Context, url string, headers map[string]string) (*http.Response, error) {
 	req, err := c.buildRequest(ctx, http.MethodHead, url, headers, nil)
 	if err != nil {
@@ -249,8 +269,12 @@ func (c *Client) Head(ctx context.Context, url string, headers map[string]string
 
 // buildRequest creates an [http.Request] with optional JSON body and headers.
 func (c *Client) buildRequest(ctx context.Context, method, url string, headers map[string]string, body any) (*http.Request, error) {
+	// hasBody treats a typed-nil body (e.g. a nil *Foo stored in the any
+	// parameter) the same as no body, instead of sending the literal "null".
+	hasBody := !isNilValue(body)
+
 	var bodyReader io.Reader
-	if body != nil {
+	if hasBody {
 		payload, err := json.Marshal(body)
 		if err != nil {
 			return nil, fmt.Errorf("httpc: marshal request body: %w", err)
@@ -258,20 +282,39 @@ func (c *Client) buildRequest(ctx context.Context, method, url string, headers m
 		bodyReader = bytes.NewReader(payload)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
+	req, err := http.NewRequestWithContext(ctx, method, c.resolveURL(url), bodyReader)
 	if err != nil {
 		return nil, fmt.Errorf("httpc: create request: %w", err)
 	}
 
-	if body != nil {
+	if hasBody {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	req.Header.Set("Accept", "application/json")
 
+	// Precedence (later wins): standard headers above, then client-wide
+	// defaults, then per-call headers.
+	for k, v := range c.defaultHeaders {
+		req.Header.Set(k, v)
+	}
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
 	return req, nil
+}
+
+// resolveURL prefixes a relative request URL with the configured base URL.
+// A URL that already carries a scheme is used as-is, so absolute URLs bypass
+// the base. Joining is plain concatenation with slash normalization — query
+// strings in the path are preserved untouched.
+func (c *Client) resolveURL(target string) string {
+	if c.baseURL == "" || strings.Contains(target, "://") {
+		return target
+	}
+	if target == "" {
+		return c.baseURL
+	}
+	return c.baseURL + "/" + strings.TrimLeft(target, "/")
 }
 
 // doRequestJSON builds, executes, and JSON-decodes the response.
@@ -358,6 +401,23 @@ func (c *Client) readBody(r io.Reader) ([]byte, error) {
 	return data, nil
 }
 
+// isNilValue reports whether v is nil, including a typed nil (a nil pointer,
+// map, or slice stored in a non-nil interface), which json.Marshal would
+// otherwise serialize as the literal "null". Only these three kinds are
+// checked: they are the marshalable nilable kinds. A nil func or chan still
+// reaches json.Marshal and fails loudly there, surfacing the caller's mistake.
+func isNilValue(v any) bool {
+	if v == nil {
+		return true
+	}
+	switch rv := reflect.ValueOf(v); rv.Kind() {
+	case reflect.Pointer, reflect.Map, reflect.Slice:
+		return rv.IsNil()
+	default:
+		return false
+	}
+}
+
 // drainAndClose consumes up to drainLimit leftover body bytes so the connection
 // can be reused, then closes it. The cap prevents an oversized or malicious
 // body from forcing an unbounded read just to recycle a connection; if more
@@ -370,10 +430,20 @@ func drainAndClose(r io.ReadCloser) {
 // --- Options ---
 
 // WithHTTPClient overrides the underlying [http.Client].
+//
+// The client struct is shallow-copied so that later mutating options
+// ([WithTimeout], [WithCheckRedirect]) modify the copy, never the caller's
+// client. The Transport is shared by reference — its connection pool is reused.
+// Isolation cuts both ways: changes the caller makes to hc after New (Timeout,
+// Jar, CheckRedirect) are not observed by this Client either.
+//
+// Place this option before mutating options: a [WithTimeout] listed earlier
+// would be overwritten by the replacement client.
 func WithHTTPClient(hc *http.Client) Option {
 	return func(c *Client) {
 		if hc != nil {
-			c.http = hc
+			clone := *hc
+			c.http = &clone
 		}
 	}
 }
@@ -408,12 +478,43 @@ func WithTimeout(d time.Duration) Option {
 // against memory exhaustion from oversized or malicious responses. The default
 // is 10 MiB. Pass 0 (or a negative value) to disable the limit. When a body
 // exceeds the cap, JSON/Raw methods return an error wrapping [ErrResponseTooLarge].
+//
+// The limit counts decompressed bytes (Go transparently decompresses gzip
+// responses), which is what actually occupies memory — do not size it from
+// Content-Length, which reflects the compressed payload.
 func WithMaxResponseBytes(n int64) Option {
 	return func(c *Client) {
 		if n < 0 {
 			n = 0
 		}
 		c.maxResponseBytes = n
+	}
+}
+
+// WithBaseURL sets a base URL that is prefixed to relative request URLs, so
+// call sites pass only the path ("/v1/users") instead of rebuilding the full
+// URL. A trailing slash on the base is trimmed. Request URLs that already
+// contain a scheme ("https://...") bypass the base and are used as-is.
+func WithBaseURL(u string) Option {
+	return func(c *Client) {
+		c.baseURL = strings.TrimRight(u, "/")
+	}
+}
+
+// WithDefaultHeaders sets headers applied to every request — typically
+// Authorization, User-Agent, or a service-identity header. A per-call header
+// with the same name overrides the default. The map is copied; changes the
+// caller makes to it after New are not observed. Repeated use merges into the
+// existing defaults.
+func WithDefaultHeaders(h map[string]string) Option {
+	return func(c *Client) {
+		if len(h) == 0 {
+			return
+		}
+		if c.defaultHeaders == nil {
+			c.defaultHeaders = make(map[string]string, len(h))
+		}
+		maps.Copy(c.defaultHeaders, h)
 	}
 }
 
@@ -426,7 +527,35 @@ func WithTransport(t http.RoundTripper) Option {
 	}
 }
 
+// WithMaxIdleConnsPerHost sets the maximum idle (keep-alive) connections kept
+// per host (default 10). Raise this when most traffic targets a single
+// upstream, so high concurrency does not churn through new connections.
+//
+// The transport is cloned before the change, so a transport shared via
+// [WithHTTPClient] is never mutated — at the cost that this client gets its
+// own connection pool. A nil transport falls back to a clone of
+// [http.DefaultTransport]. A custom non-[*http.Transport] RoundTripper is
+// left untouched — configure its pool directly instead.
+func WithMaxIdleConnsPerHost(n int) Option {
+	return func(c *Client) {
+		if n <= 0 {
+			return
+		}
+		t, ok := c.http.Transport.(*http.Transport)
+		if !ok {
+			if c.http.Transport != nil {
+				return
+			}
+			t = http.DefaultTransport.(*http.Transport)
+		}
+		clone := t.Clone()
+		clone.MaxIdleConnsPerHost = n
+		c.http.Transport = clone
+	}
+}
+
 // newDefaultHTTPClient creates an HTTP client with production-grade defaults:
+//   - Proxy from environment (HTTP_PROXY / HTTPS_PROXY / NO_PROXY)
 //   - Connection pooling (MaxIdleConns=100, MaxIdleConnsPerHost=10)
 //   - Keep-alive (30s)
 //   - HTTP/2
@@ -435,6 +564,7 @@ func WithTransport(t http.RoundTripper) Option {
 func newDefaultHTTPClient(timeout time.Duration) *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
 			DialContext: (&net.Dialer{
 				Timeout:   5 * time.Second,
 				KeepAlive: 30 * time.Second,

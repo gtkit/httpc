@@ -37,7 +37,7 @@ func echoServer() *httptest.Server {
 			"auth":         r.Header.Get("Authorization"),
 		}
 		data, _ := json.Marshal(resp)
-		w.Write(data)
+		_, _ = w.Write(data)
 	}))
 }
 
@@ -67,7 +67,7 @@ func TestNew_NilOptions(t *testing.T) {
 func TestWithoutRedirect(t *testing.T) {
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("target"))
+		_, _ = w.Write([]byte("target"))
 	}))
 	defer target.Close()
 
@@ -91,7 +91,7 @@ func TestWithoutRedirect(t *testing.T) {
 
 func TestWithCheckRedirect(t *testing.T) {
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"ok":true}`))
+		_, _ = w.Write([]byte(`{"ok":true}`))
 	}))
 	defer target.Close()
 
@@ -288,7 +288,7 @@ func TestDo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 200 {
 		t.Errorf("status = %d", resp.StatusCode)
 	}
@@ -311,7 +311,7 @@ func TestPostJSON_NetworkError(t *testing.T) {
 
 func TestPostJSON_InvalidJSON(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("not json"))
+		_, _ = w.Write([]byte("not json"))
 	}))
 	defer srv.Close()
 
@@ -345,7 +345,7 @@ func TestPostJSON_ContextCancelled(t *testing.T) {
 func TestPostJSON_Non2xx(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(500)
-		w.Write([]byte(`{"error":"bad"}`))
+		_, _ = w.Write([]byte(`{"error":"bad"}`))
 	}))
 	defer srv.Close()
 	c := New(WithHTTPClient(srv.Client()))
@@ -363,7 +363,7 @@ func TestPostJSON_Non2xx(t *testing.T) {
 func TestGetRaw_LargeResponse(t *testing.T) {
 	big := strings.Repeat("x", 200000)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(big))
+		_, _ = w.Write([]byte(big))
 	}))
 	defer srv.Close()
 	c := New(WithHTTPClient(srv.Client()))
@@ -455,7 +455,7 @@ func headerServer() *httptest.Server {
 		w.Header().Add("X-Multi", "a")
 		w.Header().Add("X-Multi", "b")
 		data, _ := json.Marshal(map[string]any{"method": r.Method})
-		w.Write(data)
+		_, _ = w.Write(data)
 	}))
 }
 
@@ -545,7 +545,7 @@ func TestWithHeader_DecodeError_StillReturnsHeader(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Request-Id", "req-err")
 		w.WriteHeader(500)
-		w.Write([]byte("not json"))
+		_, _ = w.Write([]byte("not json"))
 	}))
 	defer srv.Close()
 	c := New(WithHTTPClient(srv.Client()))

@@ -95,7 +95,7 @@ c = httpc.New(httpc.WithMaxIdleConnsPerHost(50))
 c = httpc.New(httpc.WithHTTPClient(myClient), httpc.WithTimeout(5*time.Second))
 ```
 
-行为说明：body 传 `nil`（包括存进 `any` 的 typed-nil 指针/map/slice）时不发送请求体、不设置 `Content-Type`，而不是发送 JSON 字面量 `null`。如需显式发送 `null`，请传 `json.RawMessage("null")`。
+行为说明：body 传 `nil`（包括存进 `any` 的 typed-nil 指针/map/slice）时不发送请求体、不设置 `Content-Type`，而不是发送 JSON 字面量 `null`。JSON 便捷方法不提供 raw JSON body 入口；如需显式发送原始 `null`，请使用低层 `Do` 自行构造 `*http.Request`。
 
 注意：重试有意不内置 —— 只有调用方知道哪些请求幂等、该用什么退避策略。请求体支持重放（`GetBody` 已设置），调用方可安全地重发。
 
